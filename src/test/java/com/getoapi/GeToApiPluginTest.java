@@ -1,13 +1,13 @@
-package com.example;
+package com.getoapi;
 
 import net.runelite.client.RuneLite;
 import net.runelite.client.externalplugins.ExternalPluginManager;
 
-public class ExamplePluginTest
+public class GeToApiPluginTest
 {
 	public static void main(String[] args) throws Exception
 	{
-		ExternalPluginManager.loadBuiltin(ExamplePlugin.class);
+		ExternalPluginManager.loadBuiltin(GeToApiPlugin.class);
 		RuneLite.main(args);
 	}
 }
