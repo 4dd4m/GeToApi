@@ -29,6 +29,7 @@ class GeToApiPanel extends PluginPanel
 		.withZone(ZoneId.systemDefault());
 
 	private final JLabel queueLabel = new JLabel();
+	private final JLabel apiStatusLabel = new JLabel();
 	private final JLabel statusLabel = new JLabel();
 	private final JLabel skippedHeader = new JLabel();
 	private final JPanel skippedList = new JPanel();
@@ -66,7 +67,10 @@ class GeToApiPanel extends PluginPanel
 
 		JPanel controls = new JPanel(new GridLayout(0, 1, 0, 8));
 		controls.add(queueLabel);
+		controls.add(apiStatusLabel);
 		controls.add(clearButton);
+		apiStatusLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+		apiStatusLabel.setVisible(false);
 
 		JButton refreshButton = new JButton("Refresh");
 		refreshButton.setToolTipText("Re-read the GE slots and save them as fingerprints (marks finished slots as sent)");
@@ -218,6 +222,15 @@ class GeToApiPanel extends PluginPanel
 		slotBoxes[slot].setSelected(enabled);
 	}
 
+	/**
+	 * @param html what the API doesn't support, or null to hide the line
+	 */
+	void setApiStatus(String html)
+	{
+		apiStatusLabel.setVisible(html != null);
+		apiStatusLabel.setText(html == null ? "" : "<html>" + html + "</html>");
+	}
+
 	void setQueueSize(int size)
 	{
 		queueLabel.setText("Items in queue: " + size);
@@ -254,7 +267,8 @@ class GeToApiPanel extends PluginPanel
 		JLabel text = new JLabel("<html><b>" + escape(entry.getItemName()) + "</b><br>"
 			+ side + " " + NumberFormat.getIntegerInstance().format(p.getQuantity())
 			+ " · " + NumberFormat.getIntegerInstance().format(p.getTotal()) + " gp<br>"
-			+ "Slot " + entry.getSlot() + " · " + formatDate(p.getDate()) + "</html>");
+			+ (entry.getSlot() > 0 ? "Slot " + entry.getSlot() + " · " : "") + formatDate(p.getDate())
+			+ (entry.getReason() == null ? "" : "<br>" + escape(entry.getReason())) + "</html>");
 
 		JButton send = new JButton("Send");
 		send.setToolTipText("Add to the queue and post it with its original date");

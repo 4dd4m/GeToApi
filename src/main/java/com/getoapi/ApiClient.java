@@ -35,30 +35,32 @@ public class ApiClient
 	}
 
 	/**
-	 * Posts payload to {@code <baseUrl>/transactions} asynchronously; onDone receives true if the
-	 * API answered with a 2xx status.
+	 * Posts payload to {@code <baseUrl>/transactions} asynchronously.
 	 */
-	public void post(String baseUrl, Payload payload, Consumer<Boolean> onDone)
+	public void post(String baseUrl, Payload payload, Consumer<ApiResult> onDone)
 	{
 		send(baseUrl, TRANSACTIONS_PATH, "POST", payload, "transaction", onDone);
 	}
 
 	/**
-	 * Replaces the account's live GE slots via {@code PUT <baseUrl>/slots}; onDone receives true
-	 * if the API answered with a 2xx status.
+	 * Replaces the account's live GE slots via {@code PUT <baseUrl>/slots} asynchronously.
 	 */
-	public void putSlots(String baseUrl, SlotsSnapshot snapshot, Consumer<Boolean> onDone)
+	public void putSlots(String baseUrl, SlotsSnapshot snapshot, Consumer<ApiResult> onDone)
 	{
 		send(baseUrl, SLOTS_PATH, "PUT", snapshot, "slots", onDone);
 	}
 
-	private void send(String baseUrl, String path, String method, Object body, String what, Consumer<Boolean> onDone)
+	/**
+	 * Never throws; every outcome, including an invalid URL or no response, reaches onDone.
+	 * Logs at debug only: the caller decides what is worth telling the user.
+	 */
+	private void send(String baseUrl, String path, String method, Object body, String what, Consumer<ApiResult> onDone)
 	{
 		HttpUrl base = HttpUrl.parse(baseUrl == null ? "" : baseUrl.trim());
 		if (base == null)
 		{
-			log.warn("Invalid API URL '{}', {} not sent", baseUrl, what);
-			onDone.accept(false);
+			log.debug("Invalid API URL '{}', {} not sent", baseUrl, what);
+			onDone.accept(ApiResult.noResponse());
 			return;
 		}
 		HttpUrl url = base.newBuilder().addPathSegment(path).build();
@@ -74,8 +76,8 @@ public class ApiClient
 			@Override
 			public void onFailure(Call call, IOException e)
 			{
-				log.warn("Failed to send {} {} to {}: {}", what, json, url, e.getMessage());
-				onDone.accept(false);
+				log.debug("Failed to send {} {} to {}: {}", what, json, url, e.getMessage());
+				onDone.accept(ApiResult.noResponse());
 			}
 
 			@Override
@@ -83,15 +85,8 @@ public class ApiClient
 			{
 				try (response)
 				{
-					if (response.isSuccessful())
-					{
-						log.debug("Sent {} {} to {} ({})", what, json, url, response.code());
-					}
-					else
-					{
-						log.warn("API rejected {} {}: HTTP {}", what, json, response.code());
-					}
-					onDone.accept(response.isSuccessful());
+					log.debug("Sent {} {} to {}: HTTP {}", what, json, url, response.code());
+					onDone.accept(ApiResult.of(response.code()));
 				}
 			}
 		});

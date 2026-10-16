@@ -94,6 +94,12 @@ public class GeToApiPlugin extends Plugin
 	private boolean slotsDirty;
 	// The last slots update failed; the retry task marks the slots dirty again
 	private final AtomicBoolean slotsFailed = new AtomicBoolean();
+	// The API answered 404/405/501, so it doesn't implement the endpoint. Nothing is sent to it
+	// until the API URL or "Send transactions" changes, or the next login.
+	private volatile boolean transactionsUnsupported;
+	private volatile boolean slotsUnsupported;
+	// The API is unreachable; logged once per outage rather than on every retry
+	private final AtomicBoolean unreachableLogged = new AtomicBoolean();
 	private ScheduledFuture<?> retryTask;
 	private NavigationButton navButton;
 	private GeToApiPanel panel;
@@ -160,9 +166,39 @@ public class GeToApiPlugin extends Plugin
 		if (ApiConfig.GROUP.equals(event.getGroup())
 			&& ("enabled".equals(event.getKey()) || "address".equals(event.getKey())))
 		{
+			resetEndpoints();
 			sendQueue();
 			clientThread.invoke(() -> slotsDirty = true);
 		}
+	}
+
+	/**
+	 * Tries every endpoint again, e.g. after the API URL changed or the API gained an endpoint.
+	 */
+	private void resetEndpoints()
+	{
+		transactionsUnsupported = false;
+		slotsUnsupported = false;
+		updateApiStatus();
+	}
+
+	private void updateApiStatus()
+	{
+		if (panel == null)
+		{
+			return;
+		}
+		StringBuilder status = new StringBuilder();
+		if (transactionsUnsupported)
+		{
+			status.append("The API has no /transactions endpoint, so transactions stay queued.<br>");
+		}
+		if (slotsUnsupported)
+		{
+			status.append("The API has no /slots endpoint, so live slots aren't sent.");
+		}
+		String text = status.length() == 0 ? null : status.toString();
+		SwingUtilities.invokeLater(() -> panel.setApiStatus(text));
 	}
 
 	@Subscribe
@@ -175,6 +211,8 @@ public class GeToApiPlugin extends Plugin
 		}
 		else if (event.getGameState() == GameState.LOGIN_SCREEN)
 		{
+			// LOGGED_IN also follows every loading screen, so missing endpoints are retried after a logout instead
+			resetEndpoints();
 			pendingSlots.clear();
 			refreshSlotsView();
 		}
@@ -286,7 +324,8 @@ public class GeToApiPlugin extends Plugin
 		{
 			// Keep it so it can still be sent by hand from the panel
 			String itemName = itemManager.getItemComposition(offer.getItemId()).getName();
-			skipped.add(new SkippedTransaction(slot + 1, itemName, payload));
+			String reason = !config.enabled() ? "Sending was off" : "Slot " + (slot + 1) + " unticked";
+			skipped.add(new SkippedTransaction(slot + 1, itemName, payload, reason));
 			log.debug("GE transaction in slot {} skipped: {}", slot + 1, payload);
 			return;
 		}
@@ -354,7 +393,7 @@ public class GeToApiPlugin extends Plugin
 	 */
 	private void sendSlots()
 	{
-		if (!config.enabled())
+		if (!config.enabled() || slotsUnsupported)
 		{
 			return;
 		}
@@ -385,19 +424,41 @@ public class GeToApiPlugin extends Plugin
 		// Recorded before sending so changes made while this is in flight compare against it
 		configManager.setConfiguration(ApiConfig.GROUP, key, json);
 
-		apiClient.putSlots(config.address(), snapshot, success ->
+		apiClient.putSlots(config.address(), snapshot, result ->
 		{
-			if (!success)
+			switch (result.getOutcome())
 			{
-				// Forget it (unless something newer was recorded since), so the retry sends it again
-				clientThread.invoke(() ->
-				{
-					if (json.equals(configManager.getConfiguration(ApiConfig.GROUP, key)))
-					{
-						configManager.unsetConfiguration(ApiConfig.GROUP, key);
-					}
-				});
-				slotsFailed.set(true);
+				case OK:
+				case DUPLICATE:
+					break;
+				case REJECTED:
+					// The same slots would be rejected again; they're sent once they change
+					log.debug("API rejected the GE slots: HTTP {}", result.getCode());
+					break;
+				case NOT_IMPLEMENTED:
+					log.info("The API doesn't implement /slots (HTTP {}); live slots won't be sent", result.getCode());
+					slotsUnsupported = true;
+					updateApiStatus();
+					forgetSentSlots(key, json);
+					break;
+				default:
+					// Forget it so the retry task sends the slots again
+					forgetSentSlots(key, json);
+					slotsFailed.set(true);
+			}
+		});
+	}
+
+	/**
+	 * Forgets the recorded snapshot (unless something newer was recorded since), so it's sent again.
+	 */
+	private void forgetSentSlots(String key, String json)
+	{
+		clientThread.invoke(() ->
+		{
+			if (json.equals(configManager.getConfiguration(ApiConfig.GROUP, key)))
+			{
+				configManager.unsetConfiguration(ApiConfig.GROUP, key);
 			}
 		});
 	}
@@ -563,7 +624,7 @@ public class GeToApiPlugin extends Plugin
 			clientThread.invoke(() -> slotsDirty = true);
 		}
 
-		if (!config.enabled() || !sending.compareAndSet(false, true))
+		if (!config.enabled() || transactionsUnsupported || !sending.compareAndSet(false, true))
 		{
 			return;
 		}
@@ -575,14 +636,52 @@ public class GeToApiPlugin extends Plugin
 			return;
 		}
 
-		apiClient.post(config.address(), next, success ->
+		apiClient.post(config.address(), next, result ->
 		{
 			sending.set(false);
-			if (success)
+			if (result.getOutcome() != ApiResult.Outcome.FAILED && unreachableLogged.compareAndSet(true, false))
 			{
-				queue.remove(next);
-				sendQueue();
+				log.info("The API is reachable again");
 			}
+
+			switch (result.getOutcome())
+			{
+				case OK:
+				case DUPLICATE:
+					// 409: the API already has this transaction
+					queue.remove(next);
+					sendQueue();
+					break;
+				case REJECTED:
+					// Sending it again won't help; move it aside so the rest of the queue goes through
+					queue.remove(next);
+					moveToSkipped(next, "Rejected by the API (HTTP " + result.getCode() + ")");
+					sendQueue();
+					break;
+				case NOT_IMPLEMENTED:
+					// Keep everything queued; it's sent once the API has the endpoint
+					log.info("The API doesn't implement /transactions (HTTP {}); transactions stay queued", result.getCode());
+					transactionsUnsupported = true;
+					updateApiStatus();
+					break;
+				default:
+					// Down or busy: the retry task tries again
+					if (unreachableLogged.compareAndSet(false, true))
+					{
+						log.info("Can't reach the API ({}); retrying every {}s",
+							result.getCode() < 0 ? "no response" : "HTTP " + result.getCode(), RETRY_SECONDS);
+					}
+			}
+		});
+	}
+
+	private void moveToSkipped(Payload payload, String reason)
+	{
+		clientThread.invoke(() ->
+		{
+			String itemName = itemManager.getItemComposition(payload.getItemId()).getName();
+			int slot = payload.getSlot() == null ? 0 : payload.getSlot() + 1;
+			skipped.add(new SkippedTransaction(slot, itemName, payload, reason));
 		});
 	}
 
